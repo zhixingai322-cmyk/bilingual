@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "paper-bilingual-pdf"
-version = "1.1.0"
+version = "2.0.0"
 description = "Chinese-first bilingual paper PDFs with reviewed, complete original equation and figure preservation"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["PyMuPDF>=1.26,<2"]
+dependencies = ["PyMuPDF>=1.26,<2", "ReportLab>=4,<5", "Matplotlib>=3.8,<4"]
 
 [project.optional-dependencies]
 test = ["Pillow>=10"]
@@ -17,5 +17,5 @@ test = ["Pillow>=10"]
 paper-bilingual = "paper_bilingual:main"
 
 [tool.setuptools]
-py-modules = ["paper_bilingual"]
+py-modules = ["paper_bilingual", "typeset_paper"]
 package-dir = {"" = "scripts"}
