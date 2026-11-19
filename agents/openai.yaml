@@ -1,0 +1,4 @@
+interface:
+  display_name: "论文中英对照翻译"
+  short_description: "逐段中文在前、英文在后，完整保留 PDF 公式与图片"
+  default_prompt: "Use $translate-paper-bilingual to translate this English paper PDF into Chinese-English paragraph pairs, retaining all original equations and figures in reading order."
