@@ -23,7 +23,7 @@ try:
 except ImportError:
     raise SystemExit('Install PyMuPDF >=1.26,<2: python -m pip install "PyMuPDF>=1.26,<2"')
 
-VERSION = "1.1.0"
+VERSION = "2.0.0"
 EPS = 0.04
 MARGIN = 36
 MAX_HEIGHT = 14000
@@ -248,6 +248,9 @@ def geometry_errors(data, doc):
 
 
 def text_errors(data, doc):
+    if data.get("render_mode") == "typeset":
+        import typeset_paper
+        return typeset_paper.validate(data, doc)
     errors = []
     images = {p.number: [fitz.Rect(im["bbox"]) for im in p.get_image_info()] for p in doc}
     for u in data.get("units", []):
@@ -335,6 +338,8 @@ def prepare(input_pdf, job, layout="auto", target=160):
     errors = geometry_errors(data, doc)
     if errors:
         raise ValueError("Cannot construct a safe layout: " + "; ".join(errors))
+    import typeset_paper
+    data = typeset_paper.seed(data)
     write_json(job / "manifest.json", data)
     layout_proof(job, data, doc)
     doc.close()
@@ -353,9 +358,14 @@ def refresh(job):
             u["zh"] = ""
             u["ocr_text"] = ""
             u["scan_checked"] = False
+            u.pop("blocks", None)
+            u.pop("omit", None)
         u["source_text"] = current
         u["geometry_stamp"] = stamp
     data["review"] = {}
+    if data.get("render_mode") == "typeset":
+        import typeset_paper
+        data = typeset_paper.seed(data)
     errors = geometry_errors(data, doc)
     if errors:
         doc.close()
@@ -442,7 +452,7 @@ def display_regions(data, source):
     return clips, ink
 
 
-def render(job, output, draft=False):
+def render_facsimile(job, output, draft=False):
     data, source = load_job(job)
     report = check_job(data, source, require_review=not draft)
     if draft:
@@ -541,6 +551,38 @@ def render(job, output, draft=False):
     return {"output": str(output), "pairs": len(placements), "draft": draft}
 
 
+def render(job, output, draft=False):
+    """Default output always reflows text; facsimile rendering is legacy-only."""
+    import typeset_paper
+    data, source = load_job(job)
+    try:
+        if data.get("render_mode") != "typeset":
+            raise ValueError("Old facsimile job: run typeset JOB, review structured blocks, then approve again")
+        report = check_job(data, source, require_review=not draft)
+        if not report["ok"] and not draft:
+            raise ValueError("; ".join(report["errors"]))
+        if geometry_errors(data, source):
+            raise ValueError("; ".join(geometry_errors(data, source)))
+        if Path(output).resolve() == (Path(job) / "source.pdf").resolve():
+            raise ValueError("Output cannot overwrite source.pdf")
+        report["manifest_digest"] = digest(data)
+        report = typeset_paper.render_document(data, source, output, report, draft)
+        write_json(Path(output).with_suffix(".audit.json"), report)
+        return {"output": str(Path(output).resolve()), "render_mode": "typeset",
+                "body_font_size": 11, "references": "English only", "draft": draft}
+    finally:
+        source.close()
+
+
+def typeset(job):
+    import typeset_paper
+    data, source = load_job(job)
+    source.close()
+    data = typeset_paper.seed(data)
+    write_json(Path(job) / "manifest.json", data)
+    return {"render_mode": "typeset", "next": "Review text/figure/equation/reference blocks; captions and math need explicit structure"}
+
+
 def proof(pdf, directory, dpi=120):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
@@ -562,7 +604,7 @@ def main(argv=None):
     p.add_argument("job")
     p.add_argument("--layout", choices=("auto", "single", "double"), default="auto")
     p.add_argument("--target-height", type=float, default=160)
-    for cmd in ("refresh", "check", "approve"):
+    for cmd in ("refresh", "check", "approve", "typeset"):
         p = sub.add_parser(cmd)
         p.add_argument("job")
         if cmd == "check":
@@ -586,6 +628,8 @@ def main(argv=None):
             result = prepare(args.input_pdf, args.job, args.layout, args.target_height)
         elif args.command == "refresh":
             result = refresh(args.job)
+        elif args.command == "typeset":
+            result = typeset(args.job)
         elif args.command in ("check", "approve"):
             data, doc = load_job(args.job)
             result = check_job(data, doc, getattr(args, "require_review", False))
@@ -608,7 +652,7 @@ def main(argv=None):
             result = proof(args.pdf, args.directory, args.dpi)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 1 if result.get("ok") is False else 0
-    except (ValueError, KeyError, TypeError, OSError, RuntimeError, json.JSONDecodeError) as exc:
+    except (ValueError, KeyError, TypeError, OSError, RuntimeError, ImportError, json.JSONDecodeError) as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False), file=sys.stderr)
         return 1
 

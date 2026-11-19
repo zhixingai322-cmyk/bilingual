@@ -69,6 +69,7 @@ class WorkflowTest(unittest.TestCase):
 
     def translated(self):
         data = copy.deepcopy(self.data)
+        data["render_mode"] = "facsimile"
         for u in data["units"]:
             u["scan_checked"] = True
             if u["page"] == 2:
@@ -131,7 +132,7 @@ class WorkflowTest(unittest.TestCase):
         d["review"] = dict.fromkeys(("layout", "translation"), pb.digest(d))
         pb.write_json(self.job / "manifest.json", d)
         output = self.root / "bilingual.pdf"
-        pb.render(self.job, output)
+        pb.render_facsimile(self.job, output)
         audit = json.loads(output.with_suffix(".audit.json").read_text())
         self.assertTrue(audit["ok"])
         self.assertEqual(len(audit["placements"]), len(d["units"]))
@@ -184,13 +185,14 @@ class WorkflowTest(unittest.TestCase):
         job = self.root / "annotated-job"
         pb.prepare(pdf, job)
         d, doc = pb.load_job(job)
+        d["render_mode"] = "facsimile"
         for u in d["units"]:
             u["zh"], u["scan_checked"] = "此页包含可见批注。", True
         d["review"] = dict.fromkeys(("layout", "translation"), pb.digest(d))
         pb.write_json(job / "manifest.json", d)
         doc.close()
         output = self.root / "annotated-bilingual.pdf"
-        pb.render(job, output)
+        pb.render_facsimile(job, output)
         audit = json.loads(output.with_suffix(".audit.json").read_text())
         self.assertTrue(all(p["original_mode"] == "raster-240dpi" for p in audit["placements"]))
 
@@ -245,6 +247,141 @@ class WorkflowTest(unittest.TestCase):
             u["zh"] += "图内的英文标签。"
             u["scan_checked"] = True
             self.assertEqual(pb.text_errors(data, doc), [])
+
+
+class TypesetTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp=tempfile.TemporaryDirectory()
+        cls.root=Path(cls.tmp.name); cls.job=cls.root/'job'; cls.job.mkdir()
+        with fitz.open() as doc:
+            p=doc.new_page(width=600,height=800)
+            p.insert_text((50,60),'1. Model',fontsize=12)
+            p.insert_text((50,100),'A finite delay tau changes the measured phase.',fontsize=11)
+            p.insert_text((50,170),'R(t) = 1/(1+t*t)   (7)',fontsize=11)
+            p.draw_rect(fitz.Rect(50,245,260,320),color=(.1,.3,.6),width=1)
+            p.insert_text((65,280),'Original diagram',fontsize=11)
+            p.insert_text((50,350),'Figure 1. A complete vector diagram.',fontsize=10)
+            p.insert_text((50,410),'References',fontsize=12)
+            p.insert_text((50,440),'[1] A. Author. A synthetic reference. 2026.',fontsize=9)
+            doc.save(cls.job/'source.pdf')
+        cls.doc=fitz.open(cls.job/'source.pdf')
+        unit=pb.new_unit(cls.doc[0],cls.doc[0].rect,'whole-page')
+        unit['blocks']=[
+            {'type':'text','style':'heading','en':'1. Model','zh':'1. 模型'},
+            {'type':'text','en':'A finite delay tau changes the measured phase.',
+             'zh':r'有限时延 $\tau$ 改变测得的相位。中文标点（含括号）、逗号，均完整显示。'},
+            {'type':'equation','bbox':[45,145,300,190],'latex':r'R(t)=\frac{1}{1+t^2}','number':'7'},
+            {'type':'figure','bbox':[45,240,265,325], 'zh_caption':'图 1. 完整的矢量示意图。',
+             'en_caption':'Figure 1. A complete vector diagram.'},
+            {'type':'references','style':'heading','en':'References'},
+            {'type':'references','en':'[1] A. Author. A synthetic reference. 2026.'}]
+        cls.data={'schema':1,'render_mode':'typeset','tool_version':pb.VERSION,
+                  'source_sha256':pb.sha256(cls.job/'source.pdf'),'pages':[pb.rect_list(cls.doc[0].rect)],
+                  'review':{},'glossary':{},'units':[unit]}
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.doc.close();cls.tmp.cleanup()
+
+    def test_source_accounting_is_complete(self):
+        self.assertTrue(pb.check_job(self.data,self.doc)['ok'])
+
+    def test_missing_english_prose_is_blocked(self):
+        d=copy.deepcopy(self.data);d['units'][0]['blocks'][1]['en']='A delay changes phase.'
+        self.assertTrue(any('does not match source prose' in e for e in pb.text_errors(d,self.doc)))
+
+    def test_unaccounted_graphic_is_blocked(self):
+        d=copy.deepcopy(self.data);d['units'][0]['blocks'].pop(3)
+        self.assertTrue(any('original vector' in e for e in pb.text_errors(d,self.doc)))
+
+    def test_translated_reference_is_blocked(self):
+        d=copy.deepcopy(self.data);d['units'][0]['blocks'][-1]['zh']='作者，参考文献。'
+        self.assertTrue(any('English only' in e for e in pb.text_errors(d,self.doc)))
+
+    def test_missing_chinese_pair_is_blocked(self):
+        d=copy.deepcopy(self.data);d['units'][0]['blocks'][1]['zh']=''
+        self.assertTrue(any('missing Chinese' in e for e in pb.text_errors(d,self.doc)))
+
+    def test_raw_tex_is_never_silently_printed(self):
+        import typeset_paper as tp
+        with self.assertRaisesRegex(ValueError,'Cannot render math'):
+            tp.math_pdf(r'\input{/etc/passwd}')
+        with self.assertRaisesRegex(ValueError,'Cannot render math'):
+            tp.math_pdf(r'\unknowncommand{x}')
+
+    def test_vector_fraction_and_greek_render(self):
+        import typeset_paper as tp
+        raw=tp.math_pdf(r'\frac{\alpha+\beta}{\tau}+x_0^2',11,True)
+        with fitz.open(stream=raw,filetype='pdf') as doc:
+            self.assertGreater(doc[0].rect.height,10)
+            self.assertFalse(doc[0].get_images())
+            self.assertTrue(doc[0].get_fonts())
+
+    def test_final_fonts_margins_formula_number_and_references(self):
+        d=copy.deepcopy(self.data)
+        d['review']=dict.fromkeys(('layout','translation'),pb.digest(d))
+        pb.write_json(self.job/'manifest.json',d)
+        output=self.root/'typeset.pdf';pb.render(self.job,output)
+        audit=json.loads(output.with_suffix('.audit.json').read_text())
+        body=[p for p in audit['text_placements'] if p['style']=='body']
+        self.assertEqual({p['language'] for p in body},{'zh','en'})
+        self.assertEqual({p['font_size'] for p in body},{11})
+        self.assertEqual({p['leading'] for p in body},{16})
+        self.assertEqual({round(p['bbox'][0],2) for p in body},{44})
+        self.assertEqual({round(p['bbox'][2],2) for p in body},{551.28})
+        self.assertEqual(body[0]['output_page'],body[1]['output_page'])
+        self.assertLessEqual(body[0]['bbox'][3],body[1]['bbox'][1])
+        refs=[p for p in audit['text_placements'] if p['type']=='references']
+        self.assertTrue(refs);self.assertEqual({p['language'] for p in refs},{'en'})
+        equation=next(a for a in audit['assets'] if a['type']=='equation')
+        self.assertIn('vector PDF',equation['renderer'])
+        with fitz.open(output) as doc:
+            all_text='\n'.join(p.get_text() for p in doc)
+            self.assertIn('（含括号）、逗号，',all_text)
+            self.assertIn('Original diagram',all_text)
+            self.assertIn('[1] A. Author.',all_text)
+            self.assertNotIn('参考文献',all_text)
+            self.assertNotIn(r'\frac',all_text)
+            tag=doc[equation['output_page']].search_for('(7)')
+            self.assertTrue(tag)
+            center=(equation['bbox'][1]+equation['bbox'][3])/2
+            self.assertLess(abs((tag[0].y0+tag[0].y1)/2-center),5)
+            self.assertTrue(all(any(s['size']==11 for b in doc[p['output_page']].get_text('dict')['blocks'] if b['type']==0 for l in b['lines'] for s in l['spans']) for p in body))
+
+    def test_body_cannot_be_hidden_as_page_furniture(self):
+        d=copy.deepcopy(self.data)
+        d['units'][0]['omit']=[{'bbox':[0,0,600,800],'reason':'running_footer'}]
+        self.assertTrue(any('only explicit' in e for e in pb.text_errors(d,self.doc)))
+
+    def test_scanned_prose_requires_checked_ocr(self):
+        d=copy.deepcopy(self.data);u=d['units'][0]
+        u['ocr_reflow']=True;u['ocr_text']='';u['scan_checked']=False
+        self.assertTrue(any('OCR transcription' in e for e in pb.text_errors(d,self.doc)))
+
+    def test_heading_pair_stays_with_following_body_pair(self):
+        # Exercise pagination independently of the source-accounting validator.
+        import typeset_paper as tp
+        d=copy.deepcopy(self.data)
+        blocks=[]
+        for i in range(10):
+            blocks.append({'type':'text','style':'heading','en':f'{i+1}. A section','zh':f'{i+1}. 章节'})
+            blocks.append({'type':'text','en':'A complete scientific passage describes the measured response and its assumptions. '*6,
+                           'zh':'这一完整段落说明测量响应与相应假设。'*5})
+        d['units'][0]['blocks']=blocks
+        output=self.root/'headings.pdf'
+        report=tp.render_document(d,self.doc,output,{})
+        placements=report['text_placements']
+        for i,p in enumerate(placements):
+            if p['style']=='heading' and p['language']=='en':
+                self.assertEqual(p['output_page'],placements[i+1]['output_page'])
+                self.assertEqual(placements[i+1]['style'],'body')
+
+    def test_old_job_requires_explicit_semantic_upgrade(self):
+        d=copy.deepcopy(self.data);d.pop('render_mode')
+        pb.write_json(self.job/'manifest.json',d)
+        with self.assertRaisesRegex(ValueError,'Old facsimile job'):
+            pb.render(self.job,self.root/'old.pdf')
 
 
 if __name__ == "__main__":
